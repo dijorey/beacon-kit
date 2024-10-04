@@ -31,7 +31,7 @@ import (
 	"github.com/berachain/beacon-kit/mod/primitives/pkg/transition"
 )
 
-// Service is the blockchain service.
+// Service represents the blockchain service.
 type Service[
 	AvailabilityStoreT AvailabilityStore[BeaconBlockBodyT],
 	BeaconBlockT BeaconBlock[BeaconBlockBodyT],
@@ -46,57 +46,35 @@ type Service[
 	GenesisT Genesis[DepositT, ExecutionPayloadHeaderT],
 	PayloadAttributesT PayloadAttributes,
 ] struct {
-	// storageBackend represents the backend storage for beacon states and
-	// associated sidecars.
-	storageBackend StorageBackend[
-		AvailabilityStoreT,
-		BeaconStateT,
-	]
-	// logger is used for logging messages in the service.
-	logger log.Logger
-	// chainSpec holds the chain specifications.
-	chainSpec common.ChainSpec
-	// dispatcher is the dispatcher for the service.
-	dispatcher asynctypes.Dispatcher
-	// executionEngine is the execution engine responsible for processing
-	//
-	// execution payloads.
-	executionEngine ExecutionEngine[PayloadAttributesT]
-	// localBuilder is a local builder for constructing new beacon states.
-	localBuilder LocalBuilder[BeaconStateT]
-	// stateProcessor is the state processor for beacon blocks and states.
-	stateProcessor StateProcessor[
+	storageBackend           StorageBackend[AvailabilityStoreT, BeaconStateT]
+	logger                   log.Logger
+	chainSpec                common.ChainSpec
+	dispatcher               asynctypes.Dispatcher
+	executionEngine          ExecutionEngine[PayloadAttributesT]
+	localBuilder             LocalBuilder[BeaconStateT]
+	stateProcessor           StateProcessor[
 		BeaconBlockT,
 		BeaconStateT,
 		*transition.Context,
 		DepositT,
 		ExecutionPayloadHeaderT,
 	]
-	// metrics is the metrics for the service.
-	metrics *chainMetrics
-	// optimisticPayloadBuilds is a flag used when the optimistic payload
-	// builder is enabled.
-	optimisticPayloadBuilds bool
-	// forceStartupSyncOnce is used to force a sync of the startup head.
-	forceStartupSyncOnce *sync.Once
-
-	// subFinalBlkReceived is a channel holding FinalBeaconBlockReceived events.
-	subFinalBlkReceived chan async.Event[BeaconBlockT]
-	// subBlockReceived is a channel holding BeaconBlockReceived events.
-	subBlockReceived chan async.Event[BeaconBlockT]
-	// subGenDataReceived is a channel holding GenesisDataReceived events.
-	subGenDataReceived chan async.Event[GenesisT]
+	metrics                  *chainMetrics
+	optimisticPayloadBuilds   bool
+	forceStartupSyncOnce      *sync.Once
+	subFinalBlkReceived       chan async.Event[BeaconBlockT]
+	subBlockReceived          chan async.Event[BeaconBlockT]
+	subGenDataReceived        chan async.Event[GenesisT]
 }
 
-// NewService creates a new validator service.
+// NewService initializes and returns a new Service instance.
 func NewService[
 	AvailabilityStoreT AvailabilityStore[BeaconBlockBodyT],
 	BeaconBlockT BeaconBlock[BeaconBlockBodyT],
 	BeaconBlockBodyT BeaconBlockBody[ExecutionPayloadT],
 	BeaconBlockHeaderT BeaconBlockHeader,
 	BeaconStateT ReadOnlyBeaconState[
-		BeaconStateT, BeaconBlockHeaderT,
-		ExecutionPayloadHeaderT,
+		BeaconStateT, BeaconBlockHeaderT, ExecutionPayloadHeaderT,
 	],
 	DepositT any,
 	ExecutionPayloadT ExecutionPayload,
@@ -104,10 +82,7 @@ func NewService[
 	GenesisT Genesis[DepositT, ExecutionPayloadHeaderT],
 	PayloadAttributesT PayloadAttributes,
 ](
-	storageBackend StorageBackend[
-		AvailabilityStoreT,
-		BeaconStateT,
-	],
+	storageBackend StorageBackend[AvailabilityStoreT, BeaconStateT],
 	logger log.Logger,
 	chainSpec common.ChainSpec,
 	dispatcher asynctypes.Dispatcher,
@@ -155,32 +130,34 @@ func (s *Service[
 	return "blockchain"
 }
 
-// Start subscribes the Blockchain service to GenesisDataReceived,
-// BeaconBlockReceived, and FinalBeaconBlockReceived events, and begins
-// the main event loop to handle them accordingly.
+// Start subscribes the Blockchain service to various events and starts the main event loop.
 func (s *Service[
 	_, _, _, _, _, _, _, _, _, _,
 ]) Start(ctx context.Context) error {
-	if err := s.dispatcher.Subscribe(
-		async.GenesisDataReceived, s.subGenDataReceived,
-	); err != nil {
+	if err := s.subscribeToEvents(); err != nil {
 		return err
 	}
-
-	if err := s.dispatcher.Subscribe(
-		async.BeaconBlockReceived, s.subBlockReceived,
-	); err != nil {
-		return err
-	}
-
-	if err := s.dispatcher.Subscribe(
-		async.FinalBeaconBlockReceived, s.subFinalBlkReceived,
-	); err != nil {
-		return err
-	}
-
-	// start the main event loop to listen and handle events.
 	go s.eventLoop(ctx)
+	return nil
+}
+
+// subscribeToEvents subscribes to all necessary events for the blockchain service.
+func (s *Service[
+	_, _, _, _, _, _, _, _, _, _,
+]) subscribeToEvents() error {
+	subscriptions := []struct {
+		eventType async.EventType
+		channel   interface{}
+	}{
+		{async.GenesisDataReceived, s.subGenDataReceived},
+		{async.BeaconBlockReceived, s.subBlockReceived},
+		{async.FinalBeaconBlockReceived, s.subFinalBlkReceived},
+	}
+	for _, sub := range subscriptions {
+		if err := s.dispatcher.Subscribe(sub.eventType, sub.channel); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -193,123 +170,62 @@ func (s *Service[
 		case <-ctx.Done():
 			return
 		case event := <-s.subGenDataReceived:
-			s.handleGenDataReceived(event)
+			s.handleEvent(event, s.handleGenDataReceived)
 		case event := <-s.subBlockReceived:
-			s.handleBeaconBlockReceived(event)
+			s.handleEvent(event, s.handleBeaconBlockReceived)
 		case event := <-s.subFinalBlkReceived:
-			s.handleBeaconBlockFinalization(event)
+			s.handleEvent(event, s.handleBeaconBlockFinalization)
 		}
 	}
 }
 
-/* -------------------------------------------------------------------------- */
-/*                                Event Handlers                              */
-/* -------------------------------------------------------------------------- */
+// handleEvent abstracts common event handling logic to avoid redundancy.
+func (s *Service[
+	_, BeaconBlockT, _, _, _, _, _, _, _, _,
+]) handleEvent[T any](msg async.Event[T], handler func(async.Event[T])) {
+	if msg.Error() != nil {
+		s.logger.Error("Error processing event", "error", msg.Error())
+		return
+	}
+	handler(msg)
+}
 
-// handleGenDataReceived processes the genesis data received and emits a
-// GenesisDataProcessed event containing the resulting validator updates.
+// handleGenDataReceived processes genesis data and emits an event with the result.
 func (s *Service[
 	_, _, _, _, _, _, _, _, GenesisT, _,
 ]) handleGenDataReceived(msg async.Event[GenesisT]) {
-	var (
-		valUpdates transition.ValidatorUpdates
-		genesisErr error
-	)
-	if msg.Error() != nil {
-		s.logger.Error("Error processing genesis data", "error", msg.Error())
+	valUpdates, err := s.ProcessGenesisData(msg.Context(), msg.Data())
+	if err != nil {
+		s.logger.Error("Failed to process genesis data", "error", err)
 	}
+	s.publishEvent(msg, async.GenesisDataProcessed, valUpdates, err)
+}
 
-	// Process the genesis data.
-	valUpdates, genesisErr = s.ProcessGenesisData(msg.Context(), msg.Data())
-	if genesisErr != nil {
-		s.logger.Error("Failed to process genesis data", "error", genesisErr)
-	}
+// handleBeaconBlockReceived processes a received block and emits a verification event.
+func (s *Service[
+	_, BeaconBlockT, _, _, _, _, _, _, _, _,
+]) handleBeaconBlockReceived(msg async.Event[BeaconBlockT]) {
+	err := s.VerifyIncomingBlock(msg.Context(), msg.Data())
+	s.publishEvent(msg, async.BeaconBlockVerified, msg.Data(), err)
+}
 
-	// Emit the event containing the validator updates.
+// handleBeaconBlockFinalization processes a finalized block and emits a validator updates event.
+func (s *Service[
+	_, BeaconBlockT, _, _, _, _, _, _, _, _,
+]) handleBeaconBlockFinalization(msg async.Event[BeaconBlockT]) {
+	valUpdates, err := s.ProcessBeaconBlock(msg.Context(), msg.Data())
+	s.publishEvent(msg, async.FinalValidatorUpdatesProcessed, valUpdates, err)
+}
+
+// publishEvent abstracts the logic for emitting an event to reduce duplication.
+func (s *Service[
+	_, BeaconBlockT, _, _, _, _, _, _, _, _,
+]) publishEvent[T any](msg async.Event[T], eventType async.EventType, data any, err error) {
 	if err := s.dispatcher.Publish(
-		async.NewEvent(
-			msg.Context(),
-			async.GenesisDataProcessed,
-			valUpdates,
-			genesisErr,
-		),
+		async.NewEvent(msg.Context(), eventType, data, err),
 	); err != nil {
-		s.logger.Error(
-			"Failed to emit event in process genesis data",
-			"error", err,
-		)
+		s.logger.Error("Failed to publish event", "error", err)
 		panic(err)
 	}
 }
 
-// handleBeaconBlockReceived emits a BeaconBlockVerified event with the error
-// result from VerifyIncomingBlock.
-func (s *Service[
-	_, BeaconBlockT, _, _, _, _, _, _, _, _,
-]) handleBeaconBlockReceived(
-	msg async.Event[BeaconBlockT],
-) {
-	// If the block is nil, exit early.
-	if msg.Error() != nil {
-		s.logger.Error("Error processing beacon block", "error", msg.Error())
-		return
-	}
-
-	// emit a BeaconBlockVerified event with the error result from \
-	// VerifyIncomingBlock
-	if err := s.dispatcher.Publish(
-		async.NewEvent(
-			msg.Context(),
-			async.BeaconBlockVerified,
-			msg.Data(),
-			s.VerifyIncomingBlock(msg.Context(), msg.Data()),
-		),
-	); err != nil {
-		s.logger.Error(
-			"Failed to emit event in verify beacon block",
-			"error", err,
-		)
-	}
-}
-
-// handleBeaconBlockFinalization processes the finalized beacon block and emits
-// a FinalValidatorUpdatesProcessed event containing the resulting validator
-// updates.
-func (s *Service[
-	_, BeaconBlockT, _, _, _, _, _, _, _, _,
-]) handleBeaconBlockFinalization(
-	msg async.Event[BeaconBlockT],
-) {
-	var (
-		valUpdates  transition.ValidatorUpdates
-		finalizeErr error
-	)
-	// If there's an error in the event, log it and return
-	if msg.Error() != nil {
-		s.logger.Error("Error verifying beacon block", "error", msg.Error())
-		return
-	}
-
-	// process the verified block and get the validator updates
-	valUpdates, finalizeErr = s.ProcessBeaconBlock(msg.Context(), msg.Data())
-	if finalizeErr != nil {
-		s.logger.Error("Failed to process verified beacon block",
-			"error", finalizeErr,
-		)
-	}
-
-	// Emit the event containing the validator updates.
-	if err := s.dispatcher.Publish(
-		async.NewEvent(
-			msg.Context(),
-			async.FinalValidatorUpdatesProcessed,
-			valUpdates,
-			finalizeErr,
-		),
-	); err != nil {
-		s.logger.Error(
-			"Failed to emit event in finalize beacon block",
-			"error", err,
-		)
-	}
-}
